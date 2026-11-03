@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mobility Prediction Playground</title>
+<style>
+:root{--bg:#fafaf9;--fg:#1c1c1a;--mut:#6b6b66;--card:#fff;--line:#dcdbd5;--grid:#e6e5e0;--heat:37,99,235;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--fg:#ecebe6;--mut:#a3a29b;--card:#222220;--line:#3a3a36;--grid:#2c2c29;--heat:96,165,250;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#161615;--fg:#ecebe6;--mut:#a3a29b;--card:#222220;--line:#3a3a36;--grid:#2c2c29;--heat:96,165,250;color-scheme:dark}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;padding:14px;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:980px;margin:0 auto}
+h1{font-size:20px;margin:0 0 4px}p{margin:4px 0;color:var(--mut)}
+.bar{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin:12px 0}
+.bar label{display:flex;flex-direction:column;font-size:12px;color:var(--mut);gap:2px}
+button{font:inherit;padding:7px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+button.on{background:#2563eb;border-color:#2563eb;color:#fff}
+canvas{width:100%;height:auto;display:block;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.card b{display:block;font-size:22px}.card span{font-size:12px;color:var(--mut)}
+.badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px;background:var(--card);border:1px solid var(--line)}
+small{color:var(--mut)}
+</style></head><body><div class="wrap">
+<h1>Mobility Prediction Playground</h1>
+<p>Step 1: run with prediction <b>off</b>. Nodes travel between their own favourite places and the model only watches. Step 2: switch prediction <b>on</b> and watch it guess each node’s next cell.</p>
+<div class="bar">
+<label>Nodes: <output id="nv">8</output><input id="nodes" type="range" min="1" max="30" value="8"></label>
+<label>Speed: <output id="sv">8</output> steps/s<input id="speed" type="range" min="1" max="40" value="8"></label>
+<label>Randomness: <output id="rv">5</output>%<input id="noise" type="range" min="0" max="40" value="5"></label>
+<button id="run">Run</button><button id="pred">Prediction: off</button><button id="reset">Reset</button>
+<span class="badge" id="phase">Learning phase</span>
+</div>
+<canvas id="c"></canvas>
+<p><small>Cells are virtual 200 m cells. Shading = how often cells were visited. Squares = a node’s favourite places. Solid outline + line = most likely next cell, dashed outlines = 2nd and 3rd guesses.</small></p>
+<div class="grid">
+<div class="card"><b id="s_t1">–</b><span>Top-1 accuracy</span></div>
+<div class="card"><b id="s_t3">–</b><span>Top-3 accuracy</span></div>
+<div class="card"><b id="s_bl">–</b><span>Baseline: repeat last move</span></div>
+<div class="card"><b id="s_cov">–</b><span>Coverage (model had data)</span></div>
+<div class="card"><b id="s_tr">0</b><span>Transitions learned</span></div>
+<div class="card"><b id="s_ho">0</b><span>Handovers scored</span></div>
+<div class="card"><b id="s_re">–</b><span>Reactive interruption (ms, avg)</span></div>
+<div class="card"><b id="s_pa">–</b><span>Prediction-assisted (ms, avg)</span></div>
+<div class="card"><b id="s_wp">–</b><span>Unused preparations / handover</span></div>
+</div>
+<p><small>Handover numbers are a toy model (illustrative constants: 50 ms if the target cell was not prepared, 10 ms if it was among the top-3 guesses). The real comparison comes from NS-3.</small></p>
+</div>
+<script>
+const W=24,H=16,CS=30,$=id=>document.getElementById(id),rnd=n=>Math.floor(Math.random()*n);
+const cv=$('c'),cx=cv.getContext('2d');cv.width=W*CS;cv.height=H*CS;
+const COL=['#e11d48','#2563eb','#16a34a','#d97706','#7c3aed','#0891b2','#db2777','#65a30d'];
+const key=(x,y)=>x+','+y,xy=k=>k.split(',').map(Number);
+let nodes,m1,m2,visits,st,running=false,predict=false,timer=null;
+function reset(){
+  m1=new Map();m2=new Map();visits={};
+  st={asked:0,cov:0,scored:0,h1:0,h3:0,bl:0,blN:0,react:0,assist:0,waste:0,trans:0};
+  nodes=[];const n=+$('nodes').value;
+  for(let i=0;i<n;i++){
+    const wps=[];while(wps.length<3){const c=[rnd(W),rnd(H)];if(!wps.some(w=>w[0]==c[0]&&w[1]==c[1]))wps.push(c);}
+    const nd={x:wps[0][0],y:wps[0][1],px:null,py:null,wps,pref:Math.random()<.5,col:COL[i%COL.length],pred:null};
+    nodes.push(nd);pickTarget(nd);
+  }
+  draw();stats();
+}
+function pickTarget(n){let w;do{w=n.wps[rnd(3)]}while(w[0]==n.x&&w[1]==n.y);n.tx=w[0];n.ty=w[1];}
+function nextCell(n){
+  if(Math.random()<+$('noise').value/100){
+    const d=[[1,0],[-1,0],[0,1],[0,-1]][rnd(4)],x=n.x+d[0],y=n.y+d[1];
+    if(x>=0&&x<W&&y>=0&&y<H)return[x,y];
+  }
+  const dx=Math.sign(n.tx-n.x),dy=Math.sign(n.ty-n.y);
+  let h=n.pref;if(Math.random()<.15)h=!h;
+  if(h&&!dx)h=false;else if(!h&&!dy)h=true;
+  return h?[n.x+dx,n.y]:[n.x,n.y+dy];
+}
+const learn=(m,k,nx)=>{let t=m.get(k);if(!t){t=new Map();m.set(k,t);}t.set(nx,(t.get(nx)||0)+1);};
+function predictNext(n){
+  const cur=key(n.x,n.y);let t=null;
+  if(n.px!==null)t=m2.get(key(n.px,n.py)+'>'+cur);
+  if(!t)t=m1.get(cur);
+  st.asked++;
+  if(!t)return null;
+  st.cov++;
+  return [...t.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3).map(e=>e[0]);
+}
+function tick(){
+  for(const n of nodes){
+    if(n.x==n.tx&&n.y==n.ty)pickTarget(n);
+    const [nx,ny]=nextCell(n),cur=key(n.x,n.y),nxt=key(nx,ny);
+    if(n.pred){
+      st.scored++;
+      const h3=n.pred.includes(nxt);
+      if(n.pred[0]==nxt)st.h1++;
+      if(h3)st.h3++;
+      if(n.px!==null){st.blN++;if(key(2*n.x-n.px,2*n.y-n.py)==nxt)st.bl++;}
+      st.react+=50;st.assist+=h3?10:50;st.waste+=n.pred.length-(h3?1:0);
+    }
+    learn(m1,cur,nxt);st.trans++;
+    if(n.px!==null)learn(m2,key(n.px,n.py)+'>'+cur,nxt);
+    visits[nxt]=(visits[nxt]||0)+1;
+    n.px=n.x;n.py=n.y;n.x=nx;n.y=ny;
+    n.pred=predict?predictNext(n):null;
+  }
+  draw();stats();
+}
+const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function draw(){
+  cx.clearRect(0,0,cv.width,cv.height);
+  const mx=Math.max(1,...Object.values(visits)),heat=css('--heat');
+  for(const k in visits){const [x,y]=xy(k);cx.fillStyle=`rgba(${heat},${.6*visits[k]/mx})`;cx.fillRect(x*CS,y*CS,CS,CS);}
+  cx.strokeStyle=css('--grid');cx.lineWidth=1;cx.beginPath();
+  for(let i=0;i<=W;i++){cx.moveTo(i*CS+.5,0);cx.lineTo(i*CS+.5,H*CS);}
+  for(let j=0;j<=H;j++){cx.moveTo(0,j*CS+.5);cx.lineTo(W*CS,j*CS+.5);}
+  cx.stroke();
+  for(const n of nodes){
+    cx.globalAlpha=.45;cx.fillStyle=n.col;
+    for(const w of n.wps)cx.fillRect(w[0]*CS+10,w[1]*CS+10,10,10);
+    cx.globalAlpha=1;
+    if(n.pred){
+      n.pred.forEach((k,i)=>{
+        const [x,y]=xy(k);cx.strokeStyle=n.col;cx.lineWidth=i?1.5:3;cx.setLineDash(i?[4,3]:[]);
+        cx.strokeRect(x*CS+2,y*CS+2,CS-4,CS-4);
+        if(!i){cx.setLineDash([]);cx.beginPath();cx.moveTo(n.x*CS+CS/2,n.y*CS+CS/2);cx.lineTo(x*CS+CS/2,y*CS+CS/2);cx.stroke();}
+      });
+      cx.setLineDash([]);
+    }
+    cx.beginPath();cx.arc(n.x*CS+CS/2,n.y*CS+CS/2,7,0,6.283);cx.fillStyle=n.col;cx.fill();
+    cx.strokeStyle='#fff';cx.lineWidth=2;cx.stroke();
+  }
+}
+const pc=(a,b)=>b?(100*a/b).toFixed(1)+'%':'–';
+function stats(){
+  $('s_t1').textContent=pc(st.h1,st.scored);$('s_t3').textContent=pc(st.h3,st.scored);
+  $('s_bl').textContent=pc(st.bl,st.blN);$('s_cov').textContent=pc(st.cov,st.asked);
+  $('s_tr').textContent=st.trans;$('s_ho').textContent=st.scored;
+  $('s_re').textContent=st.scored?(st.react/st.scored).toFixed(1):'–';
+  $('s_pa').textContent=st.scored?(st.assist/st.scored).toFixed(1):'–';
+  $('s_wp').textContent=st.scored?(st.waste/st.scored).toFixed(2):'–';
+}
+function restart(){clearInterval(timer);if(running)timer=setInterval(tick,1000/+$('speed').value);}
+$('run').onclick=()=>{running=!running;$('run').textContent=running?'Pause':'Run';$('run').classList.toggle('on',running);restart();};
+$('pred').onclick=()=>{
+  predict=!predict;$('pred').textContent='Prediction: '+(predict?'on':'off');$('pred').classList.toggle('on',predict);
+  $('phase').textContent=predict?'Prediction phase':'Learning phase';
+  nodes.forEach(n=>n.pred=predict?predictNext(n):null);draw();
+};
+$('reset').onclick=reset;
+$('nodes').oninput=e=>{$('nv').textContent=e.target.value;reset();};
+$('speed').oninput=e=>{$('sv').textContent=e.target.value;restart();};
+$('noise').oninput=e=>{$('rv').textContent=e.target.value;};
+reset();
+</script></body></html>
